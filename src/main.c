@@ -1,0 +1,701 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <time.h>
+#include <string.h>
+#include <stat.h>
+#include <signal.h>
+
+#define CACTSOLE_PATH "/usr/bin/cactsole"
+#define RESCUE_PATH   "/usr/bin/cactsole-rescue"
+#define DAEMON_DIR    "/usr/sbin"
+#define CONFIG_PATH   "/etc/cgoct.conf"
+#define LOG_PATH      "/var/log/cgoct.log"
+#define TTY_PATH      "/dev/tty"
+
+/* Default config written on first boot when /etc/cgoct.conf is missing. */
+static const char default_config[] =
+    "# cgoct supervisor config — auto-generated on first boot.\n"
+    "# restart_policy : always | on-failure | once\n"
+    "# rescue_shell   : 0 | 1   (try /usr/bin/cactsole-rescue on crash-loop)\n"
+    "# crash_limit    : 1..20   (fast-crash bursts before cooldown)\n"
+    "# cooldown_sec   : 1..120  (pause after crash-loop)\n"
+    "# localrepo_free : 0 | 1   (1 = release the /tmp localrepo copy once the\n"
+    "#                  configured daemons have been running for a few seconds;\n"
+    "#                  keep 0 while firmware is extracted on request)\n"
+    "# services       : opt-in — daemons from /usr/sbin to start before shell.\n"
+    "#                  Empty by default; the user (a utility) chooses the list.\n"
+    "restart_policy=always\n"
+    "rescue_shell=1\n"
+    "crash_limit=4\n"
+    "cooldown_sec=8\n"
+    "# services=logd devd netd powerd quirkd resolved seatd audiod wifid\n";
+
+static char *cactsole_argv[] = { "cactsole", NULL };
+static char *rescue_argv[]   = { "cactsole-rescue", "--safe-mode", NULL };
+/* /usr/local/{sbin,bin} first: cactpkg installs packages there, so they shadow
+ * the image's /usr/bin and /usr/sbin. */
+static char *cactsole_envp[] = { "PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin", "HOME=/", NULL };
+static int log_fd = -1;
+
+/* Supervisor tuning to avoid fast crash loops. */
+#define FAST_CRASH_SEC        3
+#define FAST_CRASH_LIMIT      4
+#define RESTART_DELAY_MIN_SEC 1
+#define RESTART_DELAY_MAX_SEC 10
+#define COOLDOWN_SEC          8
+#define CONFIG_BUF_SIZE       1024
+#define IDLE_MS               1000
+#define MIN_SLEEP_SLICE_MS    50
+
+enum restart_policy {
+    POLICY_ALWAYS = 0,
+    POLICY_ON_FAILURE = 1,
+    POLICY_ONCE = 2,
+};
+
+struct supervisor_cfg {
+    enum restart_policy policy;
+    int use_rescue_shell;
+    int crash_limit;
+    int cooldown_sec;
+    int localrepo_free;
+};
+
+/* ── Tracked background daemons (/sbin/<name>) ───────────────────────── */
+
+#define SVC_MAX     12
+#define SVC_NAME_SZ 32
+#define SVC_PATH_SZ 64
+
+struct svc {
+    char  name[SVC_NAME_SZ];
+    char  path[SVC_PATH_SZ];
+    pid_t pid;          /* 0 = not running */
+    long  next_start_ms;/* monotonic time when it may be started again */
+    long  started_ms;   /* monotonic start time of the last instance */
+    unsigned burst;     /* consecutive fast crashes */
+};
+
+static struct svc services[SVC_MAX];
+static int services_n = 0;
+
+/* ── Monotonic time ──────────────────────────────────────────────────── */
+
+static long now_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
+        return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+    }
+    return 0;
+}
+
+/* ── Utilities ───────────────────────────────────────────────────────── */
+
+static int file_exists(const char *path) {
+    struct stat st;
+    return stat(path, &st) == 0;
+}
+
+static int write_all(int fd, const char *data, int len) {
+    int total = 0;
+    while (total < len) {
+        int n = (int)write(fd, data + total, (size_t)(len - total));
+        if (n <= 0) return -1;
+        total += n;
+    }
+    return 0;
+}
+
+/* ── localrepo archive ───────────────────────────────────────────────────
+ *
+ * localrepo.tar.zst (firmware, the installer's media payload and the offline
+ * cactpkg repository) is far too big for the initfs image, so it lives on the
+ * boot medium.  Put a copy in tmpfs at boot so firmextr streams members out of
+ * it on demand, and release that copy once the daemons (the drivers) have been
+ * up for a while — after that the tmpfs copy is dead weight.
+ *
+ * Knob: localrepo_free=0 in /etc/cgoct.conf keeps the copy instead.
+ */
+#define LOCALREPO_TMP            "/tmp/localrepo.tar.zst"
+#define LOCALREPO_COPYBUF        (64 * 1024)
+#define LOCALREPO_FREE_AFTER_MS  5000L
+
+static const char *localrepo_sources[] = {
+    "/dev/localrepo",             /* GRUB loaded it as the "localrepo" module */
+    "/localrepo.tar.zst",
+    "/boot/localrepo.tar.zst",
+    "/usr/lib/localrepo.tar.zst",
+    NULL
+};
+
+static void log_text(const char *s);   /* defined below */
+
+/* A source that reports nothing to read is not an archive: an empty
+ * /dev/localrepo (a boot medium whose GRUB did not hand the module over, or
+ * handed over a zero-byte one) or a zero-length file.  Copying it would leave
+ * a zero-byte /tmp copy behind for firmextr to trip over, so it is skipped.
+ * /dev/localrepo publishes the module size, so an absent module shows up here
+ * as size 0; sources that cannot report a size (pipes) are left alone. */
+static int source_has_data(const char *path) {
+    struct stat st;
+    if (stat(path, &st) != 0) return 0;
+    if (S_ISREG(st.st_mode) || S_ISCHR(st.st_mode)) return st.st_size > 0;
+    return 1;
+}
+
+/* Copy the archive at `src` into tmpfs.  Returns the number of bytes copied —
+ * 0 when the source yields nothing (e.g. /dev/localrepo on a boot medium that
+ * carried no localrepo module) — or -1 on failure. */
+static long copy_localrepo(const char *src) {
+    char *buf = malloc(LOCALREPO_COPYBUF);
+    if (!buf) return -1;
+
+    int in = open(src, O_RDONLY);
+    if (in < 0) { free(buf); return -1; }
+
+    int out = open(LOCALREPO_TMP, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (out < 0) { close(in); free(buf); return -1; }
+
+    long total = 0;
+    for (;;) {
+        int n = (int)read(in, buf, LOCALREPO_COPYBUF);
+        if (n < 0) { total = -1; break; }
+        if (n == 0) break;
+        if (write_all(out, buf, n) != 0) { total = -1; break; }
+        total += n;
+    }
+
+    close(out);
+    close(in);
+    free(buf);
+    return total;
+}
+
+static void stage_localrepo(void) {
+    int i;
+    const char *empty = NULL;   /* a source that exists but carries nothing */
+
+    /* Already staged (or put there by hand)?  A zero-byte leftover is not an
+     * archive, so it does not count as staged. */
+    if (source_has_data(LOCALREPO_TMP)) return;
+
+    for (i = 0; localrepo_sources[i]; i++) {
+        if (!file_exists(localrepo_sources[i])) continue;
+        if (!source_has_data(localrepo_sources[i])) {
+            empty = localrepo_sources[i];
+            continue;
+        }
+
+        long n = copy_localrepo(localrepo_sources[i]);
+        if (n > 0) {
+            printf("cgoct: localrepo staged -> %s (%ld bytes)\n",
+                   LOCALREPO_TMP, n);
+            log_text("cgoct: localrepo staged in tmpfs\n");
+            return;
+        }
+        /* Never leave a partial (or empty) archive behind: the next source
+         * would be skipped, and firmextr would blame the file's contents. */
+        unlink(LOCALREPO_TMP);
+        printf("cgoct: localrepo copy failed: %s\n", localrepo_sources[i]);
+        log_text("cgoct: localrepo copy failed\n");
+    }
+
+    if (empty)
+        printf("cgoct: localrepo source is empty (no archive?): %s\n", empty);
+    printf("cgoct: no localrepo archive source found\n");
+    log_text("cgoct: no localrepo archive source\n");
+}
+
+/* Release the tmpfs copy once every configured service has been running for
+ * LOCALREPO_FREE_AFTER_MS.  With no services configured the copy stays (there
+ * were no drivers to feed, so it may still be needed). */
+static void maybe_free_localrepo(struct supervisor_cfg *cfg, int *freed,
+                                 long *all_up_ms, long now) {
+    int i;
+
+    if (*freed || !cfg->localrepo_free || services_n == 0) return;
+
+    for (i = 0; i < services_n; i++) {
+        if (services[i].pid <= 0) { *all_up_ms = 0; return; }
+    }
+    if (*all_up_ms == 0) { *all_up_ms = now; return; }
+    if (now - *all_up_ms < LOCALREPO_FREE_AFTER_MS) return;
+
+    if (unlink(LOCALREPO_TMP) == 0) {
+        printf("cgoct: localrepo released (%s removed)\n", LOCALREPO_TMP);
+        log_text("cgoct: localrepo released from tmpfs\n");
+    }
+    *freed = 1;
+}
+
+static void prepare_files(void) {
+    if (!file_exists(CONFIG_PATH)) {
+        int fd = open(CONFIG_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0) {
+            (void)write_all(fd, default_config, (int)sizeof(default_config) - 1);
+            close(fd);
+        }
+    }
+}
+
+static int setup_console(void) {
+    int fd = open(TTY_PATH, O_RDWR);
+    if (fd < 0) {
+        kprint("cgoct: warning: open(/dev/tty) failed\n");
+        return -1;
+    }
+    if (fd != 0) { dup2(fd, 0); }
+    dup2(fd, 1);
+    dup2(fd, 2);
+    if (fd > 2) close(fd);
+    return 0;
+}
+
+static void setup_log(void) {
+    log_fd = open(LOG_PATH, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (log_fd < 0) {
+        kprint("cgoct: warning: log file unavailable\n");
+    }
+}
+
+static void log_text(const char *s) {
+    if (log_fd >= 0) {
+        write(log_fd, s, (size_t)strlen(s));
+    }
+}
+
+static const char *policy_name(enum restart_policy policy) {
+    if (policy == POLICY_ON_FAILURE) return "on-failure";
+    if (policy == POLICY_ONCE) return "once";
+    return "always";
+}
+
+static const char *enabled_name(int enabled) {
+    return enabled ? "enabled" : "disabled";
+}
+
+static int status_is_success(int status) {
+    return status == 0;
+}
+
+static void cfg_defaults(struct supervisor_cfg *cfg) {
+    cfg->policy = POLICY_ALWAYS;
+    cfg->use_rescue_shell = 1;
+    cfg->crash_limit = FAST_CRASH_LIMIT;
+    cfg->cooldown_sec = COOLDOWN_SEC;
+    /* Firmware is pulled out of the archive on request (firmextr), so the tmpfs
+     * copy is kept by default; set localrepo_free=1 once the firmware a boot
+     * needs is extracted up front. */
+    cfg->localrepo_free = 0;
+}
+
+/* ── Default daemon list ─────────────────────────────────────────────── */
+
+/* The default list is commented out: daemons are only enabled by the
+ * services key in /etc/cgoct.conf — the user makes the choice (a separate utility). */
+#if 0
+static const char *default_service_names[] = {
+    "logd", "devd", "netd", "powerd", "quirkd",
+    "resolved", "seatd", "audiod", "wifid",
+};
+#endif
+
+static void add_service_name(const char *name) {
+    if (services_n >= SVC_MAX) return;
+    if (name[0] == '\0') return;
+
+    int i;
+    for (i = 0; i < services_n; i++) {
+        if (strcmp(services[i].name, name) == 0) return; /* already present */
+    }
+
+    struct svc *s = &services[services_n];
+    memset(s, 0, sizeof(*s));
+
+    if (name[0] == '/') {
+        /* Full path. */
+        strncpy(s->path, name, SVC_PATH_SZ - 1);
+        const char *slash = strrchr(name, '/');
+        const char *base = slash ? slash + 1 : name;
+        strncpy(s->name, base, SVC_NAME_SZ - 1);
+    } else {
+        strncpy(s->name, name, SVC_NAME_SZ - 1);
+        snprintf(s->path, SVC_PATH_SZ, "%s/%s", DAEMON_DIR, name);
+    }
+    s->name[SVC_NAME_SZ - 1] = '\0';
+    s->path[SVC_PATH_SZ - 1] = '\0';
+    services_n++;
+}
+
+static void services_defaults(void) {
+    services_n = 0;
+#if 0
+    size_t i;
+    for (i = 0; i < sizeof(default_service_names) / sizeof(default_service_names[0]); i++) {
+        add_service_name(default_service_names[i]);
+    }
+#endif
+}
+
+/* Add names from a value string (separators: space/comma/tab). */
+static void parse_service_names(const char *val) {
+    char buf[CONFIG_BUF_SIZE];
+    strncpy(buf, val, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    char *save = NULL;
+    char *tok = strtok_r(buf, " ,\t", &save);
+    while (tok) {
+        add_service_name(tok);
+        tok = strtok_r(NULL, " ,\t", &save);
+    }
+}
+
+/* ── Config ──────────────────────────────────────────────────────────── */
+
+static void parse_config_line(struct supervisor_cfg *cfg, char *line) {
+    int i = 0;
+    int eq = -1;
+
+    while (line[i] != '\0') {
+        if (line[i] == '=') {
+            eq = i;
+            break;
+        }
+        i++;
+    }
+
+    if (eq <= 0) return;
+
+    line[eq] = '\0';
+    char *key = line;
+    char *value = &line[eq + 1];
+
+    if (strcmp(key, "restart_policy") == 0) {
+        if (strcmp(value, "always") == 0) cfg->policy = POLICY_ALWAYS;
+        else if (strcmp(value, "on-failure") == 0) cfg->policy = POLICY_ON_FAILURE;
+        else if (strcmp(value, "once") == 0) cfg->policy = POLICY_ONCE;
+    } else if (strcmp(key, "rescue_shell") == 0) {
+        cfg->use_rescue_shell = atoi(value) ? 1 : 0;
+    } else if (strcmp(key, "crash_limit") == 0) {
+        int n = atoi(value);
+        if (n > 0 && n <= 20) cfg->crash_limit = n;
+    } else if (strcmp(key, "cooldown_sec") == 0) {
+        int n = atoi(value);
+        if (n >= 1 && n <= 120) cfg->cooldown_sec = n;
+    } else if (strcmp(key, "services") == 0) {
+        /* Full replacement of the default list. */
+        services_n = 0;
+        parse_service_names(value);
+    } else if (strcmp(key, "localrepo_free") == 0) {
+        cfg->localrepo_free = atoi(value) ? 1 : 0;
+    }
+}
+
+static void load_config(struct supervisor_cfg *cfg) {
+    char buf[CONFIG_BUF_SIZE];
+    int fd = open(CONFIG_PATH, O_RDONLY);
+    int nread, i, line_start;
+
+    cfg_defaults(cfg);
+
+    if (fd < 0) {
+        kprint("cgoct: config missing, using defaults\n");
+        return;
+    }
+
+    nread = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+
+    if (nread <= 0) {
+        kprint("cgoct: config empty, using defaults\n");
+        return;
+    }
+
+    buf[nread] = '\0';
+    line_start = 0;
+    for (i = 0; i <= nread; i++) {
+        if (buf[i] == '\n' || buf[i] == '\0') {
+            buf[i] = '\0';
+            if (buf[line_start] != '\0' && buf[line_start] != '#') {
+                parse_config_line(cfg, &buf[line_start]);
+            }
+            line_start = i + 1;
+        }
+    }
+}
+
+/* ── Spawning processes ──────────────────────────────────────────────── */
+
+static pid_t spawn_process(const char *path, char *argv[]) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        execve(path, (char *const *)argv, (char *const *)cactsole_envp);
+        log_text("cgoct: execve failed\n");
+        _exit(1);
+    }
+    if (pid < 0) {
+        log_text("cgoct: fork failed\n");
+    }
+    return pid;
+}
+
+/* Wait until deadline (or until idle_ms), but in short slices so that
+ * child crashes are noticed promptly. */
+static void sleep_slices(long ms) {
+    if (ms <= 0) return;
+    if (ms > IDLE_MS) ms = IDLE_MS;
+    while (ms > 0) {
+        long slice = ms;
+        if (slice > 200) slice = 200;
+        usleep((unsigned int)(slice * 1000L));
+        ms -= slice;
+    }
+}
+
+int main(void) {
+    struct supervisor_cfg cfg;
+    long now = now_ms();
+
+    /* Shell state. */
+    pid_t shell_pid = 0;
+    long  shell_started_ms = 0;
+    long  shell_next_start = 0;
+    int   fast_crash_count = 0;
+    int   restart_delay = RESTART_DELAY_MIN_SEC;
+    int   try_rescue_next = 0;
+    int   localrepo_freed = 0;
+    long  localrepo_all_up_ms = 0;
+
+    prepare_files();
+    services_defaults();
+    load_config(&cfg);
+    setup_log();
+    if (setup_console() < 0) {
+        log_text("cgoct: booting without tty, will retry later\n");
+    }
+    printf("cgoct: supervisor online\n");
+    printf("  restart policy : %s\n", policy_name(cfg.policy));
+    printf("  rescue shell   : %s\n", enabled_name(cfg.use_rescue_shell));
+    printf("  crash limit    : %d\n", cfg.crash_limit);
+    printf("  cooldown       : %d sec\n", cfg.cooldown_sec);
+    if (services_n > 0) {
+        printf("  services       :");
+        {
+            int i;
+            for (i = 0; i < services_n; i++) printf(" %s", services[i].name);
+        }
+        printf("\n");
+    }
+    log_text("cgoct: supervisor online\n");
+
+    /* Bring the localrepo archive into tmpfs before the daemons/drivers want
+     * firmware out of it. */
+    stage_localrepo();
+
+    while (1) {
+        now = now_ms();
+
+        /* Re-bind stdio to tty every supervisor loop iteration. */
+        setup_console();
+
+        /* ── 1. Start every daemon whose time has come ── */
+        {
+            int i;
+            for (i = 0; i < services_n; i++) {
+                struct svc *s = &services[i];
+                char *args[2];
+
+                if (s->pid > 0) continue;
+                if (now < s->next_start_ms) continue;
+                if (!file_exists(s->path)) {
+                    /* Binary not installed — skip silently, without spamming. */
+                    s->next_start_ms = now + 30000;
+                    continue;
+                }
+
+                args[0] = s->name;
+                args[1] = NULL;
+                pid_t pid = spawn_process(s->path, args);
+                if (pid <= 0) {
+                    printf("cgoct: spawn failed: %s (retry in 3s)\n", s->name);
+                    s->next_start_ms = now_ms() + 3000;
+                } else {
+                    s->pid = pid;
+                    s->started_ms = now_ms();
+                    printf("cgoct: started %s (pid=%d)\n", s->name, (int)pid);
+                    log_text("cgoct: started service\n");
+                }
+            }
+        }
+
+        /* Release the localrepo tmpfs copy once the daemons have been up for a
+         * while (they read firmware while coming up). */
+        maybe_free_localrepo(&cfg, &localrepo_freed, &localrepo_all_up_ms, now);
+
+        /* ── 2. Start the shell if it is time ── */
+        if (shell_pid <= 0 && now >= shell_next_start) {
+            const char *spawn_path = CACTSOLE_PATH;
+            char **spawn_argv = cactsole_argv;
+            char *spawn_name = cactsole_argv[0];
+
+            if (try_rescue_next && cfg.use_rescue_shell) {
+                if (file_exists(RESCUE_PATH)) {
+                    spawn_path = RESCUE_PATH;
+                    spawn_argv = rescue_argv;
+                    spawn_name = rescue_argv[0];
+                } else {
+                    log_text("cgoct: rescue shell missing, fallback to /bin/cactsole\n");
+                    try_rescue_next = 0;
+                }
+            }
+
+            pid_t pid = spawn_process(spawn_path, spawn_argv);
+            if (pid > 0) {
+                shell_pid = pid;
+                shell_started_ms = now_ms();
+                if (try_rescue_next) {
+                    try_rescue_next = 0;
+                    printf("cgoct: rescue shell started (pid=%d)\n", (int)pid);
+                } else {
+                    printf("cgoct: shell started (pid=%d)\n", (int)pid);
+                }
+            } else {
+                if (setup_console() == 0) {
+                    log_text("cgoct: tty recovered\n");
+                }
+                if (restart_delay < RESTART_DELAY_MAX_SEC) restart_delay++;
+                printf("cgoct: spawn failed: %s (retry in %d sec)\n",
+                       spawn_name, restart_delay);
+                try_rescue_next = 1;
+                shell_next_start = now_ms() + (long)restart_delay * 1000L;
+            }
+        }
+
+        /* ── 3. Reap exited children (shell and daemons) ── */
+        for (;;) {
+            int status = 0;
+            pid_t done = waitpid(-1, &status, WNOHANG);
+            if (done <= 0) break;
+
+            long lived_ms = now_ms() - shell_started_ms;
+            int  matched_shell = (shell_pid > 0 && done == shell_pid);
+
+            if (matched_shell) {
+                int exit_code = (status >> 8) & 0xff;
+                shell_pid = 0;
+
+                if (status_is_success(status)) {
+                    fast_crash_count = 0;
+                    restart_delay = 0;
+                    printf("cgoct: shell exited cleanly after %d ms (exit=%d)\n",
+                           (int)lived_ms, exit_code);
+                } else if (lived_ms <= FAST_CRASH_SEC * 1000L) {
+                    fast_crash_count++;
+                    printf("cgoct: shell crashed after %d ms (burst=%d, exit=%d)\n",
+                           (int)lived_ms, fast_crash_count, exit_code);
+                } else {
+                    fast_crash_count = 0;
+                    restart_delay = RESTART_DELAY_MIN_SEC;
+                    printf("cgoct: shell exited after %d ms (exit=%d)\n",
+                           (int)lived_ms, exit_code);
+                }
+
+                if (cfg.policy == POLICY_ONCE) {
+                    log_text("cgoct: restart_policy=once, stopping restarts\n");
+                    goto supervisor_exit;
+                }
+
+                if (cfg.policy == POLICY_ON_FAILURE && status_is_success(status)) {
+                    log_text("cgoct: clean exit with restart_policy=on-failure\n");
+                    goto supervisor_exit;
+                }
+
+                if (fast_crash_count >= cfg.crash_limit) {
+                    printf("cgoct: shell crash-loop detected (cooldown=%d sec)\n",
+                           cfg.cooldown_sec);
+                    log_text("cgoct: shell crash-loop cooldown\n");
+                    fast_crash_count = 0;
+                    restart_delay = RESTART_DELAY_MAX_SEC / 2;
+                    try_rescue_next = 1;
+                    shell_next_start = now_ms() + (long)cfg.cooldown_sec * 1000L;
+                } else if (restart_delay <= 0) {
+                    printf("cgoct: restarting shell now\n");
+                    shell_next_start = now_ms();
+                } else {
+                    printf("cgoct: restarting shell in %d sec\n", restart_delay);
+                    shell_next_start = now_ms() + (long)restart_delay * 1000L;
+                    if (restart_delay < RESTART_DELAY_MAX_SEC) restart_delay++;
+                }
+            } else {
+                /* A daemon exited. */
+                int i;
+                for (i = 0; i < services_n; i++) {
+                    struct svc *s = &services[i];
+                    if (s->pid <= 0 || s->pid != done) continue;
+                    s->pid = 0;
+                    lived_ms = now_ms() - s->started_ms;
+
+                    if (status_is_success(status)) {
+                        s->burst = 0;
+                        printf("cgoct: %s exited cleanly after %d ms\n",
+                               s->name, (int)lived_ms);
+                    } else if (lived_ms <= FAST_CRASH_SEC * 1000L) {
+                        s->burst++;
+                        printf("cgoct: %s crashed after %d ms (burst=%u)\n",
+                               s->name, (int)lived_ms, s->burst);
+                    } else {
+                        s->burst = 0;
+                        printf("cgoct: %s exited after %d ms\n",
+                               s->name, (int)lived_ms);
+                    }
+
+                    if (s->burst >= (unsigned)cfg.crash_limit) {
+                        printf("cgoct: %s crash-loop, cooldown %d sec\n",
+                               s->name, cfg.cooldown_sec);
+                        s->burst = 0;
+                        s->next_start_ms = now_ms() + (long)cfg.cooldown_sec * 1000L;
+                    } else {
+                        s->next_start_ms = now_ms() + 1000;
+                    }
+                    break;
+                }
+            }
+        }
+
+        /* ── 4. Compute how long we may sleep ── */
+        now = now_ms();
+        {
+            long deadline = 0;
+            int i;
+
+            if (shell_pid <= 0) {
+                deadline = shell_next_start - now;
+            }
+            for (i = 0; i < services_n; i++) {
+                if (services[i].pid > 0) continue;
+                long d = services[i].next_start_ms - now;
+                if (deadline == 0 || (d > 0 && d < deadline)) deadline = d;
+            }
+            if (deadline < MIN_SLEEP_SLICE_MS) deadline = MIN_SLEEP_SLICE_MS;
+            sleep_slices(deadline);
+        }
+    }
+
+supervisor_exit:
+    /* Policy "once"/"on-failure": shut the daemons down and exit. */
+    {
+        int i;
+        for (i = 0; i < services_n; i++) {
+            if (services[i].pid > 0) {
+                kill(services[i].pid, SIGTERM);
+            }
+        }
+    }
+    if (log_fd >= 0) {
+        close(log_fd);
+    }
+    return 0;
+}
