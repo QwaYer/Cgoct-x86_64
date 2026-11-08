@@ -1,8 +1,8 @@
-# 🐙 Cgoct/x86_32
+# 🐙 Cgoct/x86_64
 
 <p align="center">
   <img src="https://img.shields.io/badge/license-GPLv3-blue.svg?style=for-the-badge" alt="License: GPLv3">
-  <img src="https://img.shields.io/badge/arch-i686-red.svg?style=for-the-badge" alt="Arch: i686">
+  <img src="https://img.shields.io/badge/arch-x86_64-red.svg?style=for-the-badge" alt="Arch: x86_64">
   <img src="https://img.shields.io/badge/language-C-orange.svg?style=for-the-badge" alt="Language: C">
   <img src="https://img.shields.io/badge/link-PIE%20%2B%20clibc.so-purple.svg?style=for-the-badge" alt="PIE + clibc.so">
   <img src="https://img.shields.io/badge/role-%2Fusr%2Fbin%2Finit-0369a1.svg?style=for-the-badge" alt="Role: /usr/bin/init">
@@ -14,16 +14,20 @@
   It opens <strong><code>/dev/tty</code></strong>, supervises <strong><code>/usr/bin/cactsole</code></strong>, optional <strong><code>/usr/bin/cactsole-rescue</code></strong> on crash-loops, and writes <strong><code>/etc/cgoct.conf</code></strong> / <strong><code>/var/log/cgoct.log</code></strong> when those paths exist.
 </p>
 
+<p align="center">
+  Fork of <a href="https://github.com/QwaYer/Cgoct-x86_32"><strong>Cgoct-x86_32</strong></a> 2.0.0 — the x86_64 port; the plan is <a href="PORTING-x86_64.md"><code>PORTING-x86_64.md</code></a>.
+</p>
+
 ---
 
 ## 📊 Stats
 
 | | |
 |---|---|
-| **Main binary** | `cgoct` (also staged as **`/usr/bin/init`** in [`LocalRepoCactOS-x86_32`](../LocalRepoCactOS-x86_32)) |
+| **Main binary** | `cgoct` (also staged as **`/usr/bin/init`** in [`LocalRepoCactOS-x86_64`](../LocalRepoCactOS-x86_64)) |
 | **Child programs** | `/usr/bin/cactsole` (default), `/usr/bin/cactsole-rescue --safe-mode` (rescue path) |
 | **Load address** | PIE **ET_DYN** at **`0x08000000`** — same layout family as **cactsole** ([`link.ld`](link.ld)) |
-| **libc** | Dynamic **`clibc.so`** from **[CactLib-x86_32](https://github.com/QwaYer/CactLibc-x86_32)** at **`0x10000000`** (see CactLib linker notes) |
+| **libc** | Dynamic **`clibc.so`** from **[CactLib-x86_64](https://github.com/QwaYer/CactLibc-x86_64)** at **`0x10000000`** (see CactLib linker notes) |
 | **Fast-crash window** | Child exit **≤ 3 s** with **non-zero** status counts toward burst detection |
 | **Restart backoff** | On **fork/exec** failure: increasing delay **1 … 10 s** |
 | **Config buffer** | **1024** bytes max read from `/etc/cgoct.conf` |
@@ -34,11 +38,11 @@
 
 | Component | Role |
 |-----------|------|
-| **[CactKernel-x86_32](https://github.com/QwaYer/CactKernel-x86_32)** | Boots **`usr/bin/init`** from **binfs** (ext4 + **cctkfs** overlay). That ELF is this supervisor. |
-| **[CactLibc-x86_32](https://github.com/QwaYer/CactLibc-x86_32)** | **`clibc.so`** + **`start.o`** (under `build-meson/`) — required before linking **`cgoct`**. |
-| **[Cactsole-x86_32](https://github.com/QwaYer/Cactsole-x86_32)** | Builds **`cactsole`**; **cactsole-rescue** is a second staged copy with a different argv (see the LocalRepoCactOS build). |
-| **[LocalRepoCactOS-x86_32](../LocalRepoCactOS-x86_32)** | Packs **`cctkfs.img`**: copies **`cgoct`** → **`lib/bin/init`** and **`lib/bin/cgoct`** (packed as **`/usr/bin/…`**), plus **`cactsole`** binaries and **`clibc.so`**. |
-| **[CactOS-x86_32](https://github.com/QwaYer/CactOS-x86_32)** | **Integrator** — orchestrates **CactLibc** → **cgoct** → **LocalRepo** → **kernel** → **CactBridge** |
+| **[CactKernel-x86_64](https://github.com/QwaYer/CactKernel-x86_64)** | Boots **`usr/bin/init`** from **binfs** (ext4 + **cctkfs** overlay). That ELF is this supervisor. |
+| **[CactLibc-x86_64](https://github.com/QwaYer/CactLibc-x86_64)** | **`clibc.so`** + **`start.o`** (under `build-meson/`) — required before linking **`cgoct`**. |
+| **[Cactsole-x86_64](https://github.com/QwaYer/Cactsole-x86_64)** | Builds **`cactsole`**; **cactsole-rescue** is a second staged copy with a different argv (see the LocalRepoCactOS build). |
+| **[LocalRepoCactOS-x86_64](../LocalRepoCactOS-x86_64)** | Packs **`cctkfs.img`**: copies **`cgoct`** → **`lib/bin/init`** and **`lib/bin/cgoct`** (packed as **`/usr/bin/…`**), plus **`cactsole`** binaries and **`clibc.so`**. |
+| **[CactOS-x86_64](https://github.com/QwaYer/CactOS-x86_64)** | **Integrator** — orchestrates **CactLibc** → **cgoct** → **LocalRepo** → **kernel** → **CactBridge** |
 
 **Why a supervisor:** the kernel only launches **`init` once**. **cgoct** keeps the interactive shell (or rescue shell) alive under configurable restart policies and dampens crash-storms with cooldowns and optional rescue handoff.
 
@@ -48,18 +52,18 @@
 
 **Recommended — full workspace**
 
-**[CactOS-x86_32](https://github.com/QwaYer/CactOS-x86_32)** builds **CactLibc**, then **`cgoct`**, then packs **LocalRepo** — use **`ninja -C CactOS-x86_32/build-meson stage`** from the workspace parent.
+**[CactOS-x86_64](https://github.com/QwaYer/CactOS-x86_64)** builds **CactLibc**, then **`cgoct`**, then packs **LocalRepo** — use **`ninja -C CactOS-x86_64/build-meson stage`** from the workspace parent.
 
 **Standalone — this repository**
 
 | Tool | Notes |
 |------|-------|
-| `clang -m32` | freestanding; no 32-bit libc needed |
-| `ld -m elf_i386` | **`-pie --dynamic-linker=/lib/ld.so`** |
-| **`cactlib` option** | Path to **CactLibc-x86_32** — **`build-meson/clibc.so`** and **`build-meson/start.o`** must exist |
+| `clang -m64` | freestanding; no 64-bit libc needed |
+| `ld -m elf_x86_64` | **`-pie --dynamic-linker=/lib/ld.so`** |
+| **`cactlib` option** | Path to **CactLibc-x86_64** — **`build-meson/clibc.so`** and **`build-meson/start.o`** must exist |
 
 ```sh
-meson setup build-meson --cross-file cross/i686-cact-clang.ini
+meson setup build-meson --cross-file cross/x86_64-cact-clang.ini
 ninja -C build-meson   # build-meson/cgoct
 ninja -C build-meson clean
 ```
@@ -71,8 +75,8 @@ Stage **`cgoct`** as **`/usr/bin/init`** via **LocalRepoCactOS** (paths passed b
 ## 📂 Repository layout
 
 ```
-Cgoct-x86_32/
-├── meson.build       # clang -m32, links start.o + main.o + clibc.so
+Cgoct-x86_64/
+├── meson.build       # clang -m64, links start.o + main.o + clibc.so
 ├── link.ld           # PIE layout @ 0x08000000 (matches cactsole family)
 ├── LICENSE           # GPLv3
 ├── src/
