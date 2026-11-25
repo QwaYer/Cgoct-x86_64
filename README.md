@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  A tiny <strong>ring-3 supervisor</strong> shipped as the first userspace program (<strong><code>/usr/bin/init</code></strong> via <strong>cctkfs</strong>).<br>
+  A tiny <strong>ring-3 supervisor</strong> shipped as the first userspace program (<strong><code>/usr/bin/init</code></strong> via <strong>localbinrepo</strong>).<br>
   It opens <strong><code>/dev/tty</code></strong>, supervises <strong><code>/usr/bin/cactsole</code></strong>, optional <strong><code>/usr/bin/cactsole-rescue</code></strong> on crash-loops, and writes <strong><code>/etc/cgoct.conf</code></strong> / <strong><code>/var/log/cgoct.log</code></strong> when those paths exist.
 </p>
 
@@ -38,10 +38,10 @@
 
 | Component | Role |
 |-----------|------|
-| **[CactKernel-x86_64](https://github.com/QwaYer/CactKernel-x86_64)** | Boots **`usr/bin/init`** from **binfs** (ext4 + **cctkfs** overlay). That ELF is this supervisor. |
+| **[CactKernel-x86_64](https://github.com/QwaYer/CactKernel-x86_64)** | Boots **`usr/bin/init`** from **binfs** (ext4 + **localbinrepo** overlay). That ELF is this supervisor. |
 | **[CactLibc-x86_64](https://github.com/QwaYer/CactLibc-x86_64)** | **`clibc.so`** + **`start.o`** (under `build-meson/`) — required before linking **`cgoct`**. |
 | **[Cactsole-x86_64](https://github.com/QwaYer/Cactsole-x86_64)** | Builds **`cactsole`**; **cactsole-rescue** is a second staged copy with a different argv (see the LocalRepoCactOS build). |
-| **[LocalRepoCactOS-x86_64](../LocalRepoCactOS-x86_64)** | Packs **`cctkfs.img`**: copies **`cgoct`** → **`lib/bin/init`** and **`lib/bin/cgoct`** (packed as **`/usr/bin/…`**), plus **`cactsole`** binaries and **`clibc.so`**. |
+| **[LocalRepoCactOS-x86_64](../LocalRepoCactOS-x86_64)** | Packs **`localbinrepo.img`**: copies **`cgoct`** → **`lib/bin/init`** and **`lib/bin/cgoct`** (packed as **`/usr/bin/…`**), plus **`cactsole`** binaries and **`clibc.so`**. |
 | **[CactOS-x86_64](https://github.com/QwaYer/CactOS-x86_64)** | **Integrator** — orchestrates **CactLibc** → **cgoct** → **LocalRepo** → **kernel** → **CactBridge** |
 
 **Why a supervisor:** the kernel only launches **`init` once**. **cgoct** keeps the interactive shell (or rescue shell) alive under configurable restart policies and dampens crash-storms with cooldowns and optional rescue handoff.
